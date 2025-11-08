@@ -13,22 +13,27 @@ _id_to_symbol = {i: s for i, s in enumerate(symbols)}  # pylint: disable=unneces
 
 
 def get_bert_embeddings(text, model, tokenizer):
+    import torch, re
+
     with torch.no_grad():
         text = text.replace("+", "")
         inputs = tokenizer(text, return_tensors="pt")
-        #        print (inputs)
-        text_inputs = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-        #        print (text_inputs)
+
+        # 🔥 Move inputs to same device as the model
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        text_inputs = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0].cpu())
 
         res = model(**inputs, output_hidden_states=True)
         res = torch.cat(res["hidden_states"][-3:-2], -1).squeeze(0)
 
-        pattern = '[-,.?!;:"]'
+        pattern = r'[-,.?!;:"]'
         selected = []
         for i, t in enumerate(text_inputs):
             if t[0] != "#" and not re.match(pattern, t):
-                #                print (i, t)
                 selected.append(i)
+
         res = res[selected]
         return res
 

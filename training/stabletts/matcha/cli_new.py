@@ -1,10 +1,15 @@
-import argparse
-import datetime as dt
-import logging
 import os
 import re
+import pickle
+import argparse
+import logging
 import warnings
+import torch
+from vocos import Vocos
+import datetime as dt
 from pathlib import Path
+from functools import lru_cache
+
 
 import torch
 from matcha import text as matcha_text
@@ -29,6 +34,7 @@ def plot_spectrogram_to_numpy(spectrogram, filename):
     fig.canvas.draw()
     plt.savefig(filename)
 
+PATTERN = re.compile(r"(\.\.\.|- |[ ,.?!;:\"()])")
 
 def _prepare_multistream(text: str, model, tokenizer, wdic):
     """
@@ -39,7 +45,7 @@ def _prepare_multistream(text: str, model, tokenizer, wdic):
 
     phonemes = [("^", [], 0, 0)]
 
-    pattern = r"(\.\.\.|- |[ ,.?!;:\"()])"
+    # pattern = r"(\.\.\.|- |[ ,.?!;:\"()])"
     processed_text = text.replace("\n", " ")
     processed_text = processed_text.replace(" -", "- ")
 
@@ -47,7 +53,8 @@ def _prepare_multistream(text: str, model, tokenizer, wdic):
     cur_punc = []
     bert_word_index = 1
 
-    for word in re.split(pattern, processed_text.lower()):
+    for word in PATTERN.split(processed_text.lower()):
+
         if word == "":
             continue
 
@@ -59,7 +66,7 @@ def _prepare_multistream(text: str, model, tokenizer, wdic):
             cur_punc.append("-")
             continue
 
-        if re.match(pattern, word) and word != " ":
+        if re.match(PATTERN, word) and word != " ":
             cur_punc.append(word)
             continue
 
@@ -191,7 +198,7 @@ def load_hifigan(checkpoint_path, device):
     hifigan.remove_weight_norm()
     return hifigan
 
-from vocos import Vocos
+
 def load_vocos(device, config=None, ckpt=None):
     # Fallbacks
     default_config = "/teamspace/studios/this_studio/vosk-tts/training/stabletts/checkpoints/vocos/config.yaml"
@@ -266,8 +273,9 @@ def load_matcha(model_name, checkpoint_path, device):
 def to_waveform(mel, vocoder, denoiser=None):
 
     #    audio = vocoder(mel).clamp(-1, 1)
-    if isinstance(vocoder, tuple):
-        vocoder = vocoder[0]
+    # if isinstance(vocoder, tuple):
+    #     vocoder = vocoder[0]
+
     audio = vocoder.decode(mel).clamp(-1, 1)
 
     return audio.cpu().squeeze()
@@ -425,10 +433,14 @@ def cli():
         args.model = "custom_model"
 
     bert_model, tokenizer = get_bert()
+    bert_model = bert_model.to(device)
 
     model = load_matcha(args.model, paths["matcha"], device)
     vocoder, denoiser = load_vocoder(args.vocoder, paths["vocoder"], device)
-
+    vocoder = vocoder[0]
+    # if device.type == "cuda":
+    #     model = model.half()
+        # vocoder = vocoder.half()
     texts = get_texts(args)
     wdic, _ = get_dictionary()
 
@@ -541,6 +553,7 @@ def unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk, bert
 
         print(f"[🍵] Whisking Matcha-T(ea)TS for: {i}")
         start_t = dt.datetime.now()
+        # with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):  # Fixed: Use 'torch.amp' instead of 'torch.cuda.amp'
         output = model.synthesise(
             text_processed["x"],
             text_processed["x_lengths"],
@@ -603,7 +616,7 @@ def single_synthesis(args, device, model, vocoder, denoiser, text, spk, bert_mod
         # "full-rtf": rtf_w,
     }
 
-
+@lru_cache(maxsize=1)
 def get_bert(path="/teamspace/studios/this_studio/vosk-tts/training/stabletts/checkpoints/rubert-base"):
     from transformers import BertModel, BertTokenizer
 
@@ -613,62 +626,20 @@ def get_bert(path="/teamspace/studios/this_studio/vosk-tts/training/stabletts/ch
     return model, tokenizer
 
 
-def get_dictionary(path="/teamspace/studios/this_studio/vosk-tts/training/stabletts/db/dictionary"):
-    """
-    Robustly parse dictionary file lines of the form:
-      WORD 0.95 phoneme1 phoneme2 ...
-    - Skips blank lines and lines starting with '#'
-    - Skips malformed lines (warns via logger)
-    - If probability can't be parsed, skips the line
-    - Keeps the entry with the highest probability for each WORD
-    Returns: (wdic, probs) where wdic[word] -> [phoneme, ...], probs[word] -> float
-    """
-    wdic = {}
-    probs = {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for lineno, raw in enumerate(fh, start=1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                # split into at most 3 parts: word, prob, rest-of-line
-                parts = line.split(maxsplit=2)
-
-                if len(parts) < 2:
-                    logger.warning("Skipping malformed dictionary line %d: %r", lineno, raw)
-                    continue
-
-                word = parts[0]
-                prob_s = parts[1]
-
-                try:
-                    prob = float(prob_s)
-                except ValueError:
-                    logger.warning(
-                        "Skipping line %d: couldn't parse probability %r for word %r",
-                        lineno,
-                        prob_s,
-                        word,
-                    )
-                    continue
-
-                # phonemes may be absent -> make empty list
-                if len(parts) == 3:
-                    phonemes = parts[2].split()
-                else:
-                    phonemes = []
-
-                # keep only highest probability entry for same word
-                if probs.get(word, float("-inf")) < prob:
-                    wdic[word] = phonemes
-                    probs[word] = prob
-    except FileNotFoundError:
-        logger.error("Dictionary file not found: %s", path)
-        raise
-
+# def get_dictionary(path="db/dictionary"):
+#     wdic = {}
+#     probs = {}
+#     for line in open(path, encoding="utf-8"):
+#         items = line.split()
+#         prob = float(items[1])
+#         if probs.get(items[0], 0) < prob:
+#             wdic[items[0]] = items[2:]
+#             probs[items[0]] = prob
+#     return wdic, probs
+def get_dictionary(path="db/dictionary.pkl"):
+    with open(path, "rb") as f:
+        wdic, probs = pickle.load(f)
     return wdic, probs
-
 
 
 def print_config(args):
