@@ -1,0 +1,2 @@
+/teamspace/studios/this_studio/myfork/vosk-tts/training/stabletts/db/dictionary.pkl filter=lfs diff=lfs merge=lfs -text
+training/stabletts/db/dictionary.pkl filter=lfs diff=lfs merge=lfs -text
