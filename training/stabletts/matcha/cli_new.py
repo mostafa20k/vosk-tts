@@ -1,11 +1,13 @@
 import os
 import re
 import pickle
+import xxhash
 import argparse
 import logging
 import warnings
 import torch
 from vocos import Vocos
+import numpy as np
 import datetime as dt
 from pathlib import Path
 from functools import lru_cache
@@ -13,7 +15,7 @@ from functools import lru_cache
 
 import torch
 from matcha import text as matcha_text
-
+from transformers import BertModel, BertTokenizer
 from .prep import clean_text_for_phonemizer
 
 logger = logging.getLogger(__name__)
@@ -35,49 +37,41 @@ def plot_spectrogram_to_numpy(spectrogram, filename):
     plt.savefig(filename)
 
 PATTERN = re.compile(r"(\.\.\.|- |[ ,.?!;:\"()])")
+PUNCTUATION = {"...", ".", "!", "?", "-", ",", ";", ":"}
 
 def _prepare_multistream(text: str, model, tokenizer, wdic):
     """
-    Replicates the multistream frontend used during training.
-    Returns phoneme tuples, BERT embeddings per phone and optional duration overrides.
+    Optimized version of multistream frontend.
+    Converts text to (phonemes, BERT embeddings, duration overrides).
     """
     bert_embeddings = matcha_text.get_bert_embeddings(text, model, tokenizer)
 
+    processed_text = text.replace("\n", " ").replace(" -", "- ").lower()
+
     phonemes = [("^", [], 0, 0)]
-
-    # pattern = r"(\.\.\.|- |[ ,.?!;:\"()])"
-    processed_text = text.replace("\n", " ")
-    processed_text = processed_text.replace(" -", "- ")
-
     in_quote = 0
     cur_punc = []
     bert_word_index = 1
 
-    for word in PATTERN.split(processed_text.lower()):
-
-        if word == "":
+    for word in PATTERN.split(processed_text):
+        if not word:
             continue
 
         if word == '"':
             in_quote = 0 if in_quote == 1 else 1
             continue
 
-        if word == "- " or word == "-":
-            cur_punc.append("-")
+        if word.strip() in PUNCTUATION:
+            cur_punc.append(word.strip())
             continue
 
-        if re.match(PATTERN, word) and word != " ":
-            cur_punc.append(word)
-            continue
-
-        if word == " ":
+        if word.isspace():
             phonemes.append((" ", cur_punc, in_quote, bert_word_index))
             cur_punc = []
             continue
 
-        if word in wdic:
-            word_phonemes = wdic[word]
-        else:
+        word_phonemes = wdic.get(word)
+        if word_phonemes is None:
             word_phonemes = matcha_text.convert(word).split()
 
         for p in matcha_text.get_pos(word_phonemes):
@@ -89,54 +83,46 @@ def _prepare_multistream(text: str, model, tokenizer, wdic):
     phonemes.append((" ", cur_punc, in_quote, bert_word_index))
     phonemes.append(("$", [], 0, bert_word_index))
 
+    # آماده‌سازی نهایی خروجی‌ها
     last_punc = " "
     last_sentence_punc = " "
-
-    lp_phonemes = []
-    phone_bert_embeddings = []
-    phone_duration_extra = []
+    lp_phonemes, phone_bert_embeddings, phone_duration_extra = [], [], []
 
     for p in reversed(phonemes):
-        if "..." in p[1]:
-            last_sentence_punc = "..."
-        elif "." in p[1]:
-            last_sentence_punc = "."
-        elif "!" in p[1]:
-            last_sentence_punc = "!"
-        elif "?" in p[1]:
-            last_sentence_punc = "?"
-        elif "-" in p[1]:
-            last_sentence_punc = "-"
+        puncs = p[1]
 
-        phone_duration_ext = 20.0 if "_" in p[1] else 0.0
+        for mark in puncs:
+            if mark in PUNCTUATION:
+                last_sentence_punc = mark
+                break
 
-        if len(p[1]) > 0:
-            last_punc = p[1][0]
-            cur_punc = p[1][0]
-        else:
-            cur_punc = "_"
+        phone_duration_ext = 20.0 if "_" in puncs else 0.0
 
-        lp_phonemes.append(
-            (
+        cur_punc = puncs[0] if puncs else "_"
+        last_punc = cur_punc if puncs else last_punc
+
+        try:
+            lp_phonemes.append((
                 matcha_text._symbol_to_id[p[0]],
-                matcha_text._symbol_to_id[cur_punc],
+                matcha_text._symbol_to_id.get(cur_punc, matcha_text._symbol_to_id["_"]),
                 p[2],
-                matcha_text._symbol_to_id[last_punc],
-                matcha_text._symbol_to_id[last_sentence_punc],
-            )
-        )
+                matcha_text._symbol_to_id.get(last_punc, matcha_text._symbol_to_id["_"]),
+                matcha_text._symbol_to_id.get(last_sentence_punc, matcha_text._symbol_to_id["_"]),
+            ))
+        except KeyError as e:
+            raise KeyError(f"Unknown phoneme symbol {e} in word '{p}'")
 
         if p[3] >= len(bert_embeddings):
             raise RuntimeError("BERT alignment mismatch while processing text.")
+
         phone_bert_embeddings.append(bert_embeddings[p[3]])
         phone_duration_extra.append(phone_duration_ext)
 
-    lp_phonemes = list(reversed(lp_phonemes))
-    phone_bert_embeddings = list(reversed(phone_bert_embeddings))
-    phone_duration_extra = list(reversed(phone_duration_extra))
+    lp_phonemes.reverse()
+    phone_bert_embeddings.reverse()
+    phone_duration_extra.reverse()
 
     return lp_phonemes, phone_bert_embeddings, phone_duration_extra
-
 
 def process_text(i: int, text: str, device: torch.device, model, tokenizer, wdic):
     """i is for backwards compatibility."""
@@ -278,18 +264,30 @@ def to_waveform(mel, vocoder, denoiser=None):
 
     audio = vocoder.decode(mel).clamp(-1, 1)
 
-    return audio.cpu().squeeze()
+    return audio.squeeze()
 
 
 def save_to_folder(filename: str, output: dict, folder: str):
+    """
+    Saves waveform (and optionally mel) to disk.
+    Ensures CPU conversion and detaching from GPU happen here,
+    so the rest of the pipeline can stay fully on GPU.
+    """
     import soundfile as sf
+    
 
     folder = Path(folder)
     folder.mkdir(exist_ok=True, parents=True)
-    #    plot_spectrogram_to_numpy(np.array(output["mel"].squeeze().float().cpu()), f"{filename}.png")
-    #    np.save(folder / f"{filename}", output["mel"].cpu().numpy())
-    sf.write(folder / f"{filename}.wav", output["waveform"], 22050, "PCM_16")
+
+    waveform = output["waveform"].detach().cpu().numpy()
+
+    # Optional: if you also want to save mel spectrograms or plot
+    if "mel" in output:
+        mel = output["mel"].detach().cpu().numpy()
+
+    sf.write(folder / f"{filename}.wav", waveform, 22050, "PCM_16")
     return folder.resolve() / f"{filename}.wav"
+
 
 
 def validate_args(args):
@@ -487,7 +485,6 @@ def batched_collate_fn(batch):
 
 
 def batched_synthesis(args, device, model, vocoder, denoiser, texts, spk, bert_model, tokenizer, wdic):
-    import numpy as np
 
     total_rtf = []
     total_rtf_w = []
@@ -536,7 +533,6 @@ def batched_synthesis(args, device, model, vocoder, denoiser, texts, spk, bert_m
 
 
 def unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk, bert_model, tokenizer, wdic):
-    import numpy as np
 
     total_rtf = []
     total_rtf_w = []
@@ -568,8 +564,8 @@ def unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk, bert
         # RTF with HiFiGAN
         t = (dt.datetime.now() - start_t).total_seconds()
         rtf_w = t * 22050 / (output["waveform"].shape[-1])
-        print(f"[🍵-{i}] Matcha-TTS RTF: {output['rtf']:.4f}")
-        print(f"[🍵-{i}] Matcha-TTS + VOCODER RTF: {rtf_w:.4f}")
+        logger.info(f"[🍵-{i}] Matcha-TTS RTF: {output['rtf']:.4f}")
+        logger.info(f"[🍵-{i}] Matcha-TTS + VOCODER RTF: {rtf_w:.4f}")
         total_rtf.append(output["rtf"])
         total_rtf_w.append(rtf_w)
 
@@ -578,7 +574,7 @@ def unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk, bert
         #        output["waveform"] = to_waveform(output["mel_enc"], vocoder, denoiser)
         #        location = save_to_folder(prior_base_name, output, args.output_folder)
 
-        print(f"[+] Waveform saved: {location}")
+        logger.info(f"Waveform saved: {location}")
 
     print("".join(["="] * 100))
     print(f"[🍵] Average Matcha-TTS RTF: {np.mean(total_rtf):.4f} ± {np.std(total_rtf)}")
@@ -618,12 +614,14 @@ def single_synthesis(args, device, model, vocoder, denoiser, text, spk, bert_mod
 
 @lru_cache(maxsize=1)
 def get_bert(path="/teamspace/studios/this_studio/vosk-tts/training/stabletts/checkpoints/rubert-base"):
-    from transformers import BertModel, BertTokenizer
 
     model = BertModel.from_pretrained(path)
     tokenizer = BertTokenizer.from_pretrained(path)
-
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
     return model, tokenizer
+
 
 
 # def get_dictionary(path="db/dictionary"):
@@ -636,10 +634,34 @@ def get_bert(path="/teamspace/studios/this_studio/vosk-tts/training/stabletts/ch
 #             wdic[items[0]] = items[2:]
 #             probs[items[0]] = prob
 #     return wdic, probs
-def get_dictionary(path="db/dictionary.pkl"):
+class HashedDict(dict):
+    @staticmethod
+    def _hash_key(word):
+        # If it's already an int (e.g. when iterating), don't hash again
+        if isinstance(word, int):
+            return word
+        if isinstance(word, str):
+            return xxhash.xxh64(word.encode("utf-8")).intdigest()
+        # Fallback: stringify anything else
+        return xxhash.xxh64(str(word).encode("utf-8")).intdigest()
+
+    def __getitem__(self, word):
+        key = self._hash_key(word)
+        return super().__getitem__(key)
+
+    def get(self, word, default=None):
+        key = self._hash_key(word)
+        return super().get(key, default)
+
+    def __contains__(self, word):
+        key = self._hash_key(word)
+        return super().__contains__(key)
+
+@lru_cache(maxsize=1)
+def get_dictionary(path="/teamspace/studios/this_studio/vosk-tts/training/stabletts/db/dictionary_xxhash.pkl"):
     with open(path, "rb") as f:
         wdic, probs = pickle.load(f)
-    return wdic, probs
+    return HashedDict(wdic), probs
 
 
 def print_config(args):
